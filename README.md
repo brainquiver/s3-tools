@@ -138,6 +138,7 @@ The config directories stay in every layout: two configs often hold shards with 
 | A range whose connection breaks or whose body ends early comes down again, up to 6 times, and each pause is 5 seconds longer | A broken connection then costs one range in place of the whole object |
 | A file whose object carries a stored hash is checked against it before it takes its name | A range written at the wrong place would otherwise go unseen |
 | A file that already exists at the same size is skipped | An interrupted run continues with the next object, and a complete file is not fetched again |
+| A prefix fetches its objects under 64 MiB `--streams` at a time, each over one connection | A set of many small files would otherwise wait on one request after another |
 
 ## 9. Outputs
 

@@ -16,7 +16,8 @@ each service, the same tools reach either service.
 A delete needs --yes, because a prefix that matches more than intended is the
 one mistake that this tool cannot undo.
 
-A get writes the key under --out, and a prefix keeps its own folder structure.
+A get writes the key under --out, and a prefix keeps its own folder structure. A
+prefix fetches its small objects --streams at a time.
 It streams each object to disk, because an object can be a checkpoint of several
 gigabytes. It skips a file that is already there at the same size, so a second
 run fetches only the files that are still absent.
@@ -108,6 +109,7 @@ STREAMS = 8
 STREAM_MIN = 64 * 1024 * 1024
 CHUNK = 32 * 1024 * 1024
 TRIES = 6
+RANGE_TIMEOUT = 60
 HASH_HEADER = "x-amz-meta-sha256"
 
 
@@ -192,9 +194,11 @@ def fetch(path, fd, start, end, what):
         url, headers = sign("GET", path, empty)
         headers["Range"] = f"bytes={start}-{end}"
         pos = start
+        # A connection that stalls raises after RANGE_TIMEOUT seconds without a byte, and the
+        # range comes down again, in place of waiting out a long timeout
         with urllib.request.urlopen(
-                urllib.request.Request(url, method="GET", headers=headers), timeout=300) as r:
-            for chunk in iter(lambda: r.read(1 << 22), b""):
+                urllib.request.Request(url, method="GET", headers=headers), timeout=RANGE_TIMEOUT) as r:
+            for chunk in iter(lambda: r.read(1 << 20), b""):
                 os.pwrite(fd, chunk, pos)
                 pos += len(chunk)
         if pos != end + 1:
@@ -263,15 +267,20 @@ def get(bucket, prefix, key, out, streams=None):
     found = objects(bucket, prefix)
     if not found:
         sys.exit(f"nothing under {prefix!r} in {bucket}")
-    done = skipped = total = 0
-    for k, size in found:
-        target = out / k
-        if target.exists() and target.stat().st_size == size:
-            skipped += 1
-            continue
-        total += download(bucket, k, target, size, streams)
-        done += 1
-    print(f"  {done} fetched, {skipped} already there, {total/1e6:.1f} MB into {out}")
+    todo = [(k, size) for k, size in found
+            if not ((out / k).exists() and (out / k).stat().st_size == size)]
+    skipped = len(found) - len(todo)
+    streams = STREAMS if streams is None else streams
+    # The small objects several at a time, each over one connection; the large ones one
+    # after another, each over its own ranges
+    small = [(k, s) for k, s in todo if s < STREAM_MIN]
+    large = [(k, s) for k, s in todo if s >= STREAM_MIN]
+    total = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, streams)) as pool:
+        total += sum(pool.map(lambda ks: download(bucket, ks[0], out / ks[0], ks[1], 1), small))
+    for k, size in large:
+        total += download(bucket, k, out / k, size, streams)
+    print(f"  {len(todo)} fetched, {skipped} already there, {total/1e6:.1f} MB into {out}")
 
 
 def main():

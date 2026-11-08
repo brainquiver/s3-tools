@@ -104,3 +104,12 @@ def test_a_file_over_the_parallel_threshold_goes_up_in_parts(transport, credenti
     assert [p.body for p in parts] == [b"0123", b"4567", b"89"]
     done = transport.find("POST", KEY, "uploadId")[0].body.decode()
     assert done.index("<PartNumber>1</PartNumber>") < done.index("<PartNumber>2</PartNumber>") < done.index("<PartNumber>3</PartNumber>")
+
+
+def test_a_prefix_fetches_its_small_objects_several_at_a_time(transport, credentials, small_ranges, tmp_path):
+    names = [f"set/part-{i}.bin" for i in range(5)]
+    transport.on("GET", "/b", listing([(n, 2) for n in names]), query={"list-type"})
+    for n in names:
+        transport.on("GET", f"/b/{n}", ranged(n[-5:-4].encode() * 2))
+    s3.get("b", "set/", "", tmp_path, streams=3)
+    assert [(tmp_path / n).read_bytes() for n in names] == [n[-5:-4].encode() * 2 for n in names]
