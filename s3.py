@@ -20,8 +20,14 @@ A get writes the key under --out, and a prefix keeps its own folder structure.
 It streams each object to disk, because an object can be a checkpoint of several
 gigabytes. It skips a file that is already there at the same size, so a second
 run fetches only the files that are still absent.
+
+An object of STREAM_MIN bytes or more comes down as ranges of CHUNK bytes over
+--streams connections at once, each range written at its place in the file. One
+connection is often far slower than the link, and a connection that breaks then
+costs one range, which the tool fetches again. When the object carries its
+SHA-256 (x-amz-meta-sha256), the tool checks the file against it.
 """
-import argparse, datetime, hashlib, hmac, os, pathlib, sys
+import argparse, concurrent.futures, datetime, hashlib, hmac, http.client, os, pathlib, sys, time
 import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
@@ -97,6 +103,36 @@ def call(method, path, query=None, expect=(200, 204)):
         sys.exit(f"{method} {path} failed: {e.code} {e.read().decode(errors='replace')[:300]}")
 
 
+# Objects of STREAM_MIN bytes or more come down in ranges of CHUNK bytes over STREAMS connections
+STREAMS = 8
+STREAM_MIN = 64 * 1024 * 1024
+CHUNK = 32 * 1024 * 1024
+TRIES = 6
+HASH_HEADER = "x-amz-meta-sha256"
+
+
+def with_retries(action, what):
+    """Run action until it succeeds, TRIES times at most. Each pause is 5 seconds longer.
+
+    It tries again after a fault of the network, a short body or a 5xx or 429 reply. Any other
+    HTTP error is final, so it stops the tool at once.
+    """
+    for attempt in range(1, TRIES + 1):
+        try:
+            return action()
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code != 429:
+                sys.exit(f"{what} failed: {e.code} {e.read().decode(errors='replace')[:300]}")
+            err = e
+        except (OSError, http.client.HTTPException) as e:
+            err = e
+        if attempt == TRIES:
+            sys.exit(f"{what} failed after {TRIES} tries: {err}")
+        print(f"    {type(err).__name__} on try {attempt} of {what}, next try in {5 * attempt}s",
+              flush=True)
+        time.sleep(5 * attempt)
+
+
 def buckets():
     root = ET.fromstring(call("GET", "/"))
     rows = [(b.findtext(NS + "Name"), b.findtext(NS + "CreationDate", "")[:10])
@@ -145,41 +181,83 @@ def head(bucket, key):
         raise
 
 
-def download(bucket, key, out):
-    """Stream one object to a path, and return the number of bytes written.
+def fetch(path, fd, start, end, what):
+    """Write bytes start to end (both included) of an object at their place in the open file.
+
+    A body that ends early raises, so the caller fetches the range again.
+    """
+    def attempt():
+        empty = hashlib.sha256(b"").hexdigest()
+        # The signature carries a timestamp, so each try signs again.
+        url, headers = sign("GET", path, empty)
+        headers["Range"] = f"bytes={start}-{end}"
+        pos = start
+        with urllib.request.urlopen(
+                urllib.request.Request(url, method="GET", headers=headers), timeout=300) as r:
+            for chunk in iter(lambda: r.read(1 << 22), b""):
+                os.pwrite(fd, chunk, pos)
+                pos += len(chunk)
+        if pos != end + 1:
+            raise OSError(f"the body ended after {pos - start} of {end + 1 - start} bytes")
+    with_retries(attempt, what)
+
+
+def download(bucket, key, out, size=None, streams=None):
+    """Fetch one object to a path, and return the number of bytes written.
 
     CONTRACT: stream it. call() reads a whole response into memory, which suits a
-    listing, and an object can be a checkpoint of several gigabytes.
+    listing, and an object can be a checkpoint of several gigabytes. An object of
+    STREAM_MIN bytes or more comes down as ranges over several connections, and the
+    file is checked against the object's stored SHA-256 when it has one.
     """
-    empty = hashlib.sha256(b"").hexdigest()
-    url, headers = sign("GET", f"/{bucket}/{urllib.parse.quote(key, safe='/')}", empty)
+    streams = STREAMS if streams is None else streams
+    path = f"/{bucket}/{urllib.parse.quote(key, safe='/')}"
+    meta = head(bucket, key) if size is None or (streams > 1 and size >= STREAM_MIN) else None
+    if size is None:
+        if meta is None:
+            sys.exit(f"{key} is not in {bucket}")
+        size = int(meta.get("Content-Length", "0"))
     out.parent.mkdir(parents=True, exist_ok=True)
     part = out.with_suffix(out.suffix + ".part")
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        with urllib.request.urlopen(
-                urllib.request.Request(url, method="GET", headers=headers),
-                timeout=300) as r, open(part, "wb") as f:
-            written = 0
-            for chunk in iter(lambda: r.read(1 << 22), b""):
-                f.write(chunk)
-                written += len(chunk)
-    except urllib.error.HTTPError as e:
+        os.ftruncate(fd, size)
+        ranges = [(a, min(a + CHUNK, size) - 1) for a in range(0, size, CHUNK)] or [(0, -1)]
+        if streams > 1 and size >= STREAM_MIN:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as pool:
+                jobs = [pool.submit(fetch, path, fd, a, b, f"GET {key} bytes {a}-{b}") for a, b in ranges]
+                for j in concurrent.futures.as_completed(jobs):
+                    j.result()
+        elif size:
+            fetch(path, fd, 0, size - 1, f"GET {key}")
+    except BaseException:
+        os.close(fd)
         part.unlink(missing_ok=True)
-        sys.exit(f"GET {key} failed: {e.code} {e.read().decode(errors='replace')[:300]}")
+        raise
+    os.close(fd)
+    stored = meta.get(HASH_HEADER) if meta is not None else None
+    if stored:
+        h = hashlib.sha256()
+        with open(part, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                h.update(chunk)
+        if h.hexdigest() != stored:
+            part.unlink(missing_ok=True)
+            sys.exit(f"GET {key}: the file does not match the stored SHA-256")
     # CAUTION: rename only when the body is complete. An interrupted get then leaves
     # a .part file, and the size check accepts only a complete file.
     part.replace(out)
-    return written
+    return size
 
 
-def get(bucket, prefix, key, out):
+def get(bucket, prefix, key, out, streams=None):
     """Fetch one key, or every key under a prefix, under out."""
     if key:
         target = out / key.rsplit("/", 1)[-1] if out.is_dir() else out
         if target.exists() and target.stat().st_size:
             print(f"  {target} already {target.stat().st_size:,} bytes, skipped")
             return
-        n = download(bucket, key, target)
+        n = download(bucket, key, target, streams=streams)
         print(f"  {key} -> {target}  {n:,} bytes")
         return
     found = objects(bucket, prefix)
@@ -191,7 +269,7 @@ def get(bucket, prefix, key, out):
         if target.exists() and target.stat().st_size == size:
             skipped += 1
             continue
-        total += download(bucket, k, target)
+        total += download(bucket, k, target, size, streams)
         done += 1
     print(f"  {done} fetched, {skipped} already there, {total/1e6:.1f} MB into {out}")
 
@@ -204,6 +282,8 @@ def main():
     p.add_argument("--key", default="", help="one object, in place of a prefix")
     p.add_argument("--out", type=pathlib.Path, help="where a get writes")
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--streams", type=int, default=STREAMS,
+                   help=f"connections at once for an object of {STREAM_MIN >> 20} MiB or more (1 for one)")
     p.add_argument("--env", default=DEFAULT_ENV)
     a = p.parse_args()
     load_env(a.env)
@@ -218,7 +298,7 @@ def main():
     if a.action == "get":
         if not a.out:
             sys.exit("a get needs --out, a directory for a prefix or a path for a key")
-        return get(a.bucket, a.prefix, a.key, a.out)
+        return get(a.bucket, a.prefix, a.key, a.out, max(1, a.streams))
     found = objects(a.bucket, a.prefix)
     total = sum(s for _, s in found)
     if a.action == "ls":

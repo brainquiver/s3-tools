@@ -10,7 +10,9 @@ Each upload stores that hash as x-amz-meta-sha256. An object from an older
 version of the tool has no hash. That object keeps the size check alone, and
 the run counts it.
 
-The tool sends a file over MULTIPART_THRESHOLD as a multipart upload. A failure
+The tool sends a file over MULTIPART_THRESHOLD as a multipart upload, and with
+--streams above 1 a file over PARALLEL_THRESHOLD too, its parts over that many
+connections at once: one connection is often far slower than the link. A failure
 after the start aborts that upload, so no unfinished upload remains.
 
 The tool tries a failed request again, and each pause is longer than the one
@@ -21,7 +23,7 @@ A dataset directory goes to the bucket as its card and its curated tree, under
 the name of the directory. The caller chooses the folder in the bucket that
 holds the tree.
 """
-import argparse, hashlib, http.client, json, os, pathlib, sys, time
+import argparse, concurrent.futures, hashlib, http.client, json, os, pathlib, sys, time
 import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
@@ -38,6 +40,10 @@ MULTIPART_THRESHOLD = 5_000_000_000
 # NOTE: B2 recommends parts of 100 MB and allows 10,000 of them, so one object reaches about
 # 1 TB. Every part except the last has this size.
 PART_SIZE = 100 * 1024 * 1024
+
+# With STREAMS above 1, a file over PARALLEL_THRESHOLD goes up in parts over STREAMS connections
+STREAMS = 4
+PARALLEL_THRESHOLD = 2 * PART_SIZE
 
 # CONTRACT: the S3 code in the error body decides the case. R2 and B2 both answer 409, with
 # different meanings. B2 bucket names are global, so B2 answers BucketAlreadyOwnedByYou for a
@@ -108,7 +114,7 @@ def put(bucket, key, path, digest=None):
     """
     size = path.stat().st_size
     digest = digest or file_hash(path)
-    if size > MULTIPART_THRESHOLD:
+    if size > MULTIPART_THRESHOLD or (STREAMS > 1 and size > PARALLEL_THRESHOLD):
         return put_in_parts(bucket, key, path, digest)
 
     def attempt():
@@ -134,14 +140,22 @@ def put_in_parts(bucket, key, path, digest):
     """
     where = object_path(bucket, key)
     upload_id = with_retries(lambda: start_upload(where, digest), f"{key} start")
-    try:
-        parts = []
+    size = path.stat().st_size
+
+    def send_part(number):
+        # Each worker reads its own part, so at most STREAMS parts are in memory at once.
         with open(path, "rb") as f:
-            for number, chunk in enumerate(iter(lambda: f.read(PART_SIZE), b""), 1):
-                etag = with_retries(lambda c=chunk, n=number: put_part(where, upload_id, n, c),
-                                    f"{key} part {number}")
-                parts.append((number, etag))
-                print(f"    {key} part {number}  {len(chunk)/1e6:8.1f} MB", flush=True)
+            f.seek((number - 1) * PART_SIZE)
+            chunk = f.read(PART_SIZE)
+        etag = with_retries(lambda: put_part(where, upload_id, number, chunk),
+                            f"{key} part {number}")
+        print(f"    {key} part {number}  {len(chunk)/1e6:8.1f} MB", flush=True)
+        return number, etag
+
+    try:
+        count = max(1, -(-size // PART_SIZE))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, STREAMS)) as pool:
+            parts = sorted(pool.map(send_part, range(1, count + 1)))
         with_retries(lambda: finish_upload(where, upload_id, parts), f"{key} completion")
     except BaseException:
         abort_upload(where, upload_id)
@@ -367,6 +381,7 @@ def collect_datasets(directories, inner, whole=False):
 
 
 def main(argv=None):
+    global STREAMS
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("bucket")
     parser.add_argument("files", nargs="*", type=pathlib.Path)
@@ -385,8 +400,12 @@ def main(argv=None):
     layout.add_argument("--whole", action="store_true",
                         help="with --dataset, every file of the directory goes under NAME/ "
                              "at its own path")
+    parser.add_argument("--streams", type=int, default=STREAMS,
+                        help=f"connections at once for the parts of a file over "
+                             f"{PARALLEL_THRESHOLD >> 20} MiB (1 for one, parts only over 5 GB)")
     parser.add_argument("--env", default=DEFAULT_ENV)
     a = parser.parse_args(argv)
+    STREAMS = max(1, a.streams)
     if sum((bool(a.files), bool(a.shard_set), bool(a.dataset))) != 1:
         parser.error("name files, one --shard-set or --dataset directories, and only one of them")
     if a.dataset and a.inner is None and not a.flat and not a.whole:

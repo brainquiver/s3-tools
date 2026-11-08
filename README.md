@@ -91,6 +91,7 @@ R2 accepts the region `auto`, but B2 rejects a signature unless it names the reg
 | `push.py` tries a failed request again up to 6 times, and each pause is 5 seconds longer than the last | A short network fault must not stop a long upload |
 | Each new try signs the request again | The signature carries a timestamp, so an old signature fails |
 | A file over 5 GB goes to the bucket as a multipart upload, in parts of 100 MiB | B2 accepts at most 5 GB in one upload |
+| With `--streams` above 1 (4 by default), a file over 200 MiB goes up in parts too, that many parts at once | One connection is often far slower than the link |
 | A failure after the start of a multipart upload aborts it | An unfinished upload keeps its parts in the bucket |
 | `push.py` creates the bucket when it does not exist | An upload to a new bucket then needs one command |
 
@@ -133,6 +134,9 @@ The config directories stay in every layout: two configs often hold shards with 
 |---|---|
 | `get` writes each key under `--out` | A prefix keeps its own shape on disk |
 | Each object streams to a `.part` file, and the file takes its name when it is complete | An interrupted download leaves a `.part` file, and only a complete file takes the final name |
+| An object of 64 MiB or more comes down in ranges of 32 MiB over `--streams` connections at once (8 by default), each range written at its place in the file | One connection is often far slower than the link |
+| A range whose connection breaks or whose body ends early comes down again, up to 6 times, and each pause is 5 seconds longer | A broken connection then costs one range in place of the whole object |
+| A file whose object carries a stored hash is checked against it before it takes its name | A range written at the wrong place would otherwise go unseen |
 | A file that already exists at the same size is skipped | An interrupted run continues with the next object, and a complete file is not fetched again |
 
 ## 9. Outputs
@@ -148,6 +152,6 @@ The config directories stay in every layout: two configs often hold shards with 
 
 | Limitation | Reason |
 |---|---|
-| An interrupted download fetches that object again from the start | The tool fetches the `.part` file again in full, from the first byte |
+| An interrupted run fetches that object again from the start | The tool does not keep the ranges of an interrupted run, and within a run only a broken range comes down again |
 | Buckets are deleted by hand | `push.py` creates a bucket when it needs one, and a bucket deletion is rare |
 | On B2, `ls` lists only the current versions, and `rm` hides each object until the lifecycle rule deletes it | B2 versions every object, and the rule deletes a hidden version one day later |

@@ -50,7 +50,8 @@ def test_a_large_file_goes_up_in_ordered_parts(transport, big, monkeypatch):
     assert len(started) == 1
     assert started[0].headers["x-amz-meta-sha256"] == hashlib.sha256(b"0123456789").hexdigest()
 
-    parts = transport.find("PUT", KEY, "partNumber")
+    # The parts go up over several connections at once, so they arrive in any order.
+    parts = sorted(transport.find("PUT", KEY, "partNumber"), key=lambda p: int(p.query["partNumber"]))
     assert [p.body for p in parts] == [b"0123", b"4567", b"89"]
     assert [p.query["partNumber"] for p in parts] == ["1", "2", "3"]
     for p in parts:
