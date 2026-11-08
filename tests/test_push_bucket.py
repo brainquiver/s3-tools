@@ -3,6 +3,8 @@
 The S3 code in the error body tells the cases apart. R2 and B2 both answer 409, with
 different meanings.
 """
+import http.client
+
 import pytest
 
 import push
@@ -34,3 +36,18 @@ def test_a_new_bucket_is_reported(transport, credentials, capsys):
     transport.on("PUT", "/datasets", Reply(200))
     push.make_bucket("datasets")
     assert "bucket datasets created" in capsys.readouterr().out
+
+
+def test_a_dropped_connection_is_tried_again(transport, credentials, monkeypatch):
+    monkeypatch.setattr(push.time, "sleep", lambda seconds: None)
+    seen = []
+
+    def drop_once(call):
+        if not seen:
+            seen.append(call)
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        return error(409, "BucketAlreadyOwnedByYou")
+
+    transport.on("PUT", "/datasets", drop_once)
+    push.make_bucket("datasets")
+    assert len(transport.find("PUT", "/datasets")) == 2

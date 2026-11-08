@@ -232,21 +232,31 @@ def make_bucket(bucket):
     PUT with any code that OWN_BUCKET does not hold.
     """
     empty = hashlib.sha256(b"").hexdigest()
-    url, headers = sign("PUT", "/" + bucket, empty, length=0)
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(url, data=b"", method="PUT", headers=headers),
-            timeout=120)
+
+    def attempt():
+        # The service's reply comes back as (status, S3 code); a fault of the network raises,
+        # so with_retries tries the PUT again. A dropped connection here ended the whole
+        # push before it sent anything
+        url, headers = sign("PUT", "/" + bucket, empty, length=0)
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(url, data=b"", method="PUT", headers=headers),
+                timeout=120)
+            return 200, None
+        except urllib.error.HTTPError as e:
+            return e.code, xml_text(e.read(), "Code")
+
+    status, code = with_retries(attempt, f"bucket {bucket}")
+    if status == 200:
         print(f"  bucket {bucket} created", flush=True)
-    except urllib.error.HTTPError as e:
-        code = xml_text(e.read(), "Code")
-        if code in OWN_BUCKET:
-            return
-        if code == "BucketAlreadyExists":
-            raise RuntimeError(f"another account holds the bucket name {bucket}. B2 bucket "
-                               f"names are global, so this bucket needs another name") from None
-        raise RuntimeError(f"the creation of bucket {bucket} failed: HTTP {e.code}, "
-                           f"{code or 'with no S3 code'}") from None
+        return
+    if code in OWN_BUCKET:
+        return
+    if code == "BucketAlreadyExists":
+        raise RuntimeError(f"another account holds the bucket name {bucket}. B2 bucket "
+                           f"names are global, so this bucket needs another name")
+    raise RuntimeError(f"the creation of bucket {bucket} failed: HTTP {status}, "
+                       f"{code or 'with no S3 code'}")
 
 
 def send(bucket, pairs):
